@@ -166,7 +166,7 @@ jobs:
               "${GITHUB_WORKSPACE}/gradle-build.log" | tail -n 700 || true
           fi
 
-      - name: Locate and verify exact APK
+      - name: Locate exact APK
         id: apk
         if: success()
         shell: bash
@@ -190,10 +190,20 @@ jobs:
           print('APK:', apk, apk.stat().st_size)
           PY2
 
+      - name: Verify exact APK
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
           BT="${{ steps.sdk.outputs.sdkroot }}/build-tools/35.0.0"
           APK="${{ steps.apk.outputs.apk_path }}"
+
+          test -n "$APK"
+          test -s "$APK"
+
           "$BT/apksigner" verify --verbose "$APK"
           "$BT/aapt" dump badging "$APK" | tee apk-badging.txt
+
           grep -Fq "package: name='${{ steps.meta.outputs.application_id }}'" apk-badging.txt
           grep -Fq "versionCode='${{ steps.meta.outputs.version_code }}'" apk-badging.txt
           grep -Fq "versionName='${{ steps.meta.outputs.version_name }}'" apk-badging.txt
