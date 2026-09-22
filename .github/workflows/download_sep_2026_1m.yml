@@ -1,0 +1,239 @@
+name: Download GMK Sep 2026 1m Data
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  download:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Prepare folders
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p raw/fx raw/btc normalized logs
+
+      - name: Download FX 1m from Dukascopy
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm view dukascopy-node version
+
+          download_fx () {
+            sym="$1"
+            out="$2"
+            echo "=== ${sym} ===" | tee -a logs/fx.log
+            npx --yes dukascopy-node \
+              -i "$sym" \
+              -from 2026-09-01 \
+              -to 2026-09-23 \
+              -t m1 \
+              -f csv \
+              -v \
+              2>&1 | tee -a logs/fx.log
+
+            f="$(find . -type f -iname "${sym}-2026-09-01-2026-09-23-m1.csv" | head -1)"
+            if [ -z "$f" ]; then
+              f="$(find . -type f -iname "*${sym}*m1*.csv" | head -1)"
+            fi
+            test -n "$f"
+            test -s "$f"
+            cp "$f" "raw/fx/${out}.csv"
+          }
+
+          download_fx usdjpy USDJPY
+          download_fx eurjpy EURJPY
+          download_fx gbpjpy GBPJPY
+          download_fx audjpy AUDJPY
+          download_fx nzdjpy NZDJPY
+
+      - name: Download BTCJPY 1m from bitbank
+        shell: python
+        run: |
+          import json, time, urllib.request, csv
+          from datetime import date, timedelta
+          from pathlib import Path
+
+          out = Path("raw/btc/BTCJPY.csv")
+          rows = []
+
+          d = date(2026, 9, 1)
+          end = date(2026, 9, 23)  # exclusive
+
+          while d < end:
+              ds = d.strftime("%Y%m%d")
+              url = f"https://public.bitbank.cc/btc_jpy/candlestick/1min/{ds}"
+              print("GET", url)
+              req = urllib.request.Request(
+                  url,
+                  headers={"User-Agent": "GMK-Historical-Downloader/1.0"}
+              )
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  payload = json.load(r)
+
+              if payload.get("success") != 1:
+                  raise RuntimeError(f"bitbank failed {ds}: {payload}")
+
+              candles = payload["data"]["candlestick"][0]["ohlcv"]
+              for c in candles:
+                  # [open, high, low, close, volume, timestamp_ms]
+                  rows.append([
+                      int(c[5]),
+                      float(c[0]),
+                      float(c[1]),
+                      float(c[2]),
+                      float(c[3]),
+                      float(c[4]),
+                  ])
+
+              d += timedelta(days=1)
+              time.sleep(0.25)
+
+          rows.sort(key=lambda x: x[0])
+
+          with out.open("w", newline="", encoding="utf-8") as f:
+              w = csv.writer(f)
+              w.writerow(["timestamp_ms","open","high","low","close","volume"])
+              w.writerows(rows)
+
+          print("BTC rows:", len(rows))
+
+      - name: Normalize all six CSVs
+        shell: python
+        run: |
+          import csv, re
+          from pathlib import Path
+          from datetime import datetime, timezone
+
+          OUT = Path("normalized")
+          OUT.mkdir(exist_ok=True)
+
+          def parse_fx(src, dst):
+              text = Path(src).read_text(encoding="utf-8", errors="replace").splitlines()
+              if not text:
+                  raise RuntimeError(f"empty file: {src}")
+
+              reader = csv.reader(text)
+              rows = list(reader)
+              header = [x.strip().lower() for x in rows[0]]
+
+              # dukascopy-node CSV normally contains timestamp/open/high/low/close/volume.
+              data = rows[1:] if any("time" in h or "date" in h for h in header) else rows
+
+              out = []
+              for r in data:
+                  if len(r) < 5:
+                      continue
+                  try:
+                      first = r[0].strip()
+                      if re.fullmatch(r"\d{10,13}", first):
+                          ts = int(first)
+                          if ts < 10_000_000_000:
+                              ts *= 1000
+                      else:
+                          dt = datetime.fromisoformat(first.replace("Z","+00:00"))
+                          if dt.tzinfo is None:
+                              dt = dt.replace(tzinfo=timezone.utc)
+                          ts = int(dt.timestamp() * 1000)
+
+                      # Try common OHLC column positions.
+                      vals = [float(x) for x in r[1:5]]
+                      vol = float(r[5]) if len(r) > 5 and r[5] not in ("","null","None") else 0.0
+                      out.append([ts, vals[0], vals[1], vals[2], vals[3], vol])
+                  except Exception:
+                      continue
+
+              out.sort(key=lambda x: x[0])
+              if not out:
+                  raise RuntimeError(f"could not parse: {src}")
+
+              with Path(dst).open("w", newline="", encoding="utf-8") as f:
+                  w=csv.writer(f)
+                  w.writerow(["timestamp_ms","open","high","low","close","volume"])
+                  w.writerows(out)
+
+              print(dst, len(out), out[0][0], out[-1][0])
+
+          for sym in ["USDJPY","EURJPY","GBPJPY","AUDJPY","NZDJPY"]:
+              parse_fx(f"raw/fx/{sym}.csv", f"normalized/{sym}.csv")
+
+          # BTC already normalized.
+          btc = Path("raw/btc/BTCJPY.csv")
+          if not btc.is_file() or btc.stat().st_size == 0:
+              raise RuntimeError("BTCJPY.csv missing")
+          Path("normalized/BTCJPY.csv").write_bytes(btc.read_bytes())
+
+      - name: Validate requested date coverage
+        shell: python
+        run: |
+          import csv
+          from pathlib import Path
+          from datetime import datetime, timezone, timedelta
+
+          jst = timezone(timedelta(hours=9))
+          wanted_start = datetime(2026,9,1,0,0,tzinfo=jst).timestamp() * 1000
+          wanted_end   = datetime(2026,9,23,0,0,tzinfo=jst).timestamp() * 1000
+
+          report=[]
+          ok=True
+
+          for sym in ["USDJPY","EURJPY","GBPJPY","AUDJPY","NZDJPY","BTCJPY"]:
+              p=Path(f"normalized/{sym}.csv")
+              with p.open(encoding="utf-8") as f:
+                  rr=list(csv.DictReader(f))
+              if not rr:
+                  ok=False
+                  report.append((sym,0,None,None))
+                  continue
+
+              t=[int(x["timestamp_ms"]) for x in rr]
+              report.append((sym,len(t),min(t),max(t)))
+
+              # Must overlap the requested interval.
+              if max(t) < wanted_start or min(t) >= wanted_end:
+                  ok=False
+
+          Path("coverage.txt").write_text(
+              "\n".join(map(str,report)),
+              encoding="utf-8"
+          )
+          print(Path("coverage.txt").read_text())
+
+          if not ok:
+              raise SystemExit("coverage validation failed")
+
+      - name: Build data ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp coverage.txt normalized/
+          (cd normalized && zip -9 -r ../GMK_20260901_20260922_1M_DATA.zip .)
+          sha256sum GMK_20260901_20260922_1M_DATA.zip | tee GMK_20260901_20260922_1M_DATA.zip.sha256
+          ls -lh GMK_20260901_20260922_1M_DATA.zip
+
+      - name: Upload historical data artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GMK_20260901_20260922_1M_DATA
+          path: |
+            GMK_20260901_20260922_1M_DATA.zip
+            GMK_20260901_20260922_1M_DATA.zip.sha256
+            coverage.txt
+            logs/**
+          retention-days: 30
+          compression-level: 0
