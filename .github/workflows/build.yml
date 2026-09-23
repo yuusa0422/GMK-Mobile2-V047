@@ -90,15 +90,19 @@ jobs:
               parts = set(p.parts)
               if ".git" in parts or "buildsrc" in parts or "build" in parts or "release" in parts:
                   continue
-              if not p.name.upper().startswith("GMK_MOBILE_RULE_"):
+              upper_name = p.name.upper()
+              # Accept both production and research GMK mobile source archives.
+              # Examples:
+              #   GMK_MOBILE_RULE_V0_7_9_....zip
+              #   GMK_RESEARCH_MOBILE_RULE_V0_7_22_....zip
+              if not (upper_name.startswith("GMK_MOBILE_RULE_") or upper_name.startswith("GMK_RESEARCH_MOBILE_RULE_")):
                   continue
               meta, err = read_zip_metadata(p)
               if meta is None:
                   print(f"SKIP INVALID ZIP: {p}: {err}")
                   continue
-              if "research" in meta["version_name"].lower() or "research" in p.name.lower():
-                  print(f"SKIP RESEARCH ZIP (never auto-build): {p} {meta['version_name']}")
-                  continue
+              # Research archives are intentionally buildable in this workflow.
+              # Selection is still controlled by the internal versionCode.
               candidates.append((p, meta))
 
           if candidates:
@@ -127,6 +131,10 @@ jobs:
               selected_meta = None
               search_root = root
               print("NO SOURCE ZIP: attempting extracted Android project in repository")
+              print("ZIP FILES FOUND IN REPOSITORY:")
+              for z in sorted(root.rglob("*.zip")):
+                  if ".git" not in z.parts and "buildsrc" not in z.parts:
+                      print(" -", z)
 
           projects = []
           for settings in list(search_root.rglob("settings.gradle.kts")) + list(search_root.rglob("settings.gradle")):
@@ -483,5 +491,4 @@ jobs:
         with:
           name: GMK_MOBILE_RULE_BUILD_FAILURE_${{ github.run_id }}_${{ github.run_attempt }}
           path: failure-diagnostics/**
-          if-no-files-found: warn
-          retention-days: 14
+      
