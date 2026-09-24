@@ -24,14 +24,15 @@ jobs:
           gradle-version: '8.9'
 
       - name: Android SDK 35
+        env:
+          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
         run: |
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          sdkmanager 'platforms;android-35' 'build-tools;35.0.0' >/dev/null
+          S="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$S" --licenses >/dev/null 2>&1 || true
+          "$S" 'platforms;android-35' 'build-tools;35.0.0' >/dev/null
 
       - name: Extract
-        run: |
-          unzip -q GMK_RESEARCH_MOBILE_RULE_V0_7_28_CROSS_FUNCTION_AUDIT_20260924.zip -d src
-          rm -rf src/.github
+        run: unzip -q GMK_RESEARCH_MOBILE_RULE_V0_7_28_CROSS_FUNCTION_AUDIT_20260924.zip -d src
 
       - name: Build
         working-directory: src
