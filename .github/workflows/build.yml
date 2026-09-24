@@ -1,32 +1,49 @@
 name: Build GMK APK
-on: [workflow_dispatch]
-permissions:
-  contents: read
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "GMK_RESEARCH_MOBILE_RULE_*.zip"
+      - ".github/workflows/build.yml"
+
 jobs:
   build:
     runs-on: ubuntu-24.04
+    env:
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
+
       - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.9'
+          gradle-version: "8.9"
+
       - name: Android SDK 35
-        env:
-          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
         run: |
           S="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
           yes | "$S" --licenses >/dev/null 2>&1 || true
-          "$S" 'platforms;android-35' 'build-tools;35.0.0' >/dev/null
-      - name: Extract
-        run: unzip -q GMK_RESEARCH_MOBILE_RULE_V0_7_29_BUILD_FIX_20260924.zip -d src
+          "$S" "platforms;android-35" "build-tools;35.0.0" >/dev/null
+
+      - name: Extract latest GMK ZIP
+        run: |
+          ZIP="$(find . -maxdepth 1 -name 'GMK_RESEARCH_MOBILE_RULE_*.zip' -printf '%f\n' | sort -V | tail -1)"
+          test -n "$ZIP" || { echo "GMK ZIP not found"; exit 1; }
+          echo "Using: $ZIP"
+          rm -rf src
+          unzip -q "$ZIP" -d src
+
       - name: Build
         working-directory: src
         run: gradle --no-daemon :app:compileDebugKotlin :app:assembleDebug
+
       - uses: actions/upload-artifact@v4
         with:
-          name: GMK-v0.7.29-debug-apk
+          name: GMK-APK
           path: src/app/build/outputs/apk/debug/*.apk
