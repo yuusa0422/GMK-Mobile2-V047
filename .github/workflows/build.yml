@@ -1,49 +1,52 @@
 name: Build GMK APK
 
-on:
-  workflow_dispatch:
-  push:
-    paths:
-      - "GMK_RESEARCH_MOBILE_RULE_*.zip"
-      - ".github/workflows/build.yml"
+on: [push, workflow_dispatch]
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-24.04
-    env:
-      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
-
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-java@v5
+      - name: Extract production source
+        id: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP="$(find . -maxdepth 1 -type f -name 'GMK_MOBILE_RULE_*.zip' ! -name '*RESEARCH*' | sort -V | tail -1)"
+          test -n "$ZIP"
+          rm -rf buildsrc && mkdir buildsrc
+          unzip -q "$ZIP" -d buildsrc
+          P="$(find buildsrc -type f -name settings.gradle.kts -printf '%h\n' | head -1)"
+          test -f "$P/app/build.gradle.kts"
+          echo "dir=$P" >> "$GITHUB_OUTPUT"
+
+      - name: Test source
+        run: python3 "${{ steps.src.outputs.dir }}/tools/functional_contract_test.py"
+
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: '17'
 
       - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: "8.9"
+          gradle-version: '8.9'
 
-      - name: Android SDK 35
+      - name: Build APK
+        working-directory: ${{ steps.src.outputs.dir }}
         run: |
-          S="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
-          yes | "$S" --licenses >/dev/null 2>&1 || true
-          "$S" "platforms;android-35" "build-tools;35.0.0" >/dev/null
-
-      - name: Extract latest GMK ZIP
-        run: |
-          ZIP="$(find . -maxdepth 1 -name 'GMK_RESEARCH_MOBILE_RULE_*.zip' -printf '%f\n' | sort -V | tail -1)"
-          test -n "$ZIP" || { echo "GMK ZIP not found"; exit 1; }
-          echo "Using: $ZIP"
-          rm -rf src
-          unzip -q "$ZIP" -d src
-
-      - name: Build
-        working-directory: src
-        run: gradle --no-daemon :app:compileDebugKotlin :app:assembleDebug
+          sdkmanager 'platforms;android-35' 'build-tools;35.0.0' >/dev/null
+          gradle :app:assembleDebug --no-daemon
+          sha256sum app/build/outputs/apk/debug/app-debug.apk > app-debug.apk.sha256
 
       - uses: actions/upload-artifact@v4
         with:
-          name: GMK-APK
-          path: src/app/build/outputs/apk/debug/*.apk
+          name: GMK-MOBILE-APK
+          path: |
+            ${{ steps.src.outputs.dir }}/app/build/outputs/apk/debug/app-debug.apk
+            ${{ steps.src.outputs.dir }}/app-debug.apk.sha256
