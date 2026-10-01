@@ -16,11 +16,15 @@ jobs:
           import os, re, tempfile, zipfile
           from pathlib import Path, PurePosixPath
           root = Path.cwd()
-          archives = [p for p in root.rglob("GMK_MOBILE_V0733_AUDITED_SOURCE_20261001.zip") if ".git" not in p.parts]
+          zips = sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() == ".zip" and ".git" not in p.parts)
+          print("Repository ZIPs:", [str(p.relative_to(root)) for p in zips], flush=True)
+          def matches(stem):
+              return [p for p in zips if re.fullmatch(re.escape(stem) + r"(?:[ _-]?\([0-9-]+\)|[ _-][0-9-]+)?", p.stem, re.I)]
+          archives = matches("GMK_MOBILE_V0733_AUDITED_SOURCE_20261001")
           if len(archives) > 1:
               raise SystemExit("ERROR: multiple production ZIPs; keep exactly one")
           if archives:
-              data = [p for p in root.rglob("GMK_V0733_TEST_DATA.zip") if ".git" not in p.parts]
+              data = matches("GMK_V0733_TEST_DATA")
               if len(data) != 1:
                   raise SystemExit("ERROR: upload exactly one GMK_V0733_TEST_DATA.zip beside the source ZIP")
               archives += data
@@ -47,7 +51,7 @@ jobs:
                               target.write_bytes(z.read(i))
           projects = [p.parent for p in root.rglob("settings.gradle.kts") if ".git" not in p.parts and (p.parent / "app/build.gradle.kts").is_file()]
           if len(projects) != 1:
-              raise SystemExit("ERROR: expected one Android project or the exact v0.7.33 source ZIP")
+              raise SystemExit(f"ERROR: found {len(projects)} Android projects. Upload the v0.7.33 source ZIP AND test-data ZIP to this branch, then Run workflow. Check Repository ZIPs above.")
           project = projects[0].resolve()
           metadata = (project / "app/build.gradle.kts").read_text()
           expected = {"applicationId": '"jp.gmk.mobile.rule"', "versionCode": "103", "versionName": '"0.7.33-production-audited"'}
