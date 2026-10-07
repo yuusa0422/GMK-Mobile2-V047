@@ -15,49 +15,74 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          cache: 'pip'
+      - name: Verify downloader ZIP exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Repository root:"
+          pwd
+          echo "Repository files:"
+          ls -la
+          test -f GMK_HISTORY_DOWNLOADER_CORE.zip || {
+            echo "ERROR: GMK_HISTORY_DOWNLOADER_CORE.zip was not found in the repository root."
+            exit 1
+          }
 
       - name: Extract downloader ZIP
         shell: bash
         run: |
           set -euo pipefail
-          test -f GMK_HISTORY_DOWNLOADER_CORE.zip
           rm -rf _gmk_run
-          mkdir _gmk_run
+          mkdir -p _gmk_run
           unzip -q GMK_HISTORY_DOWNLOADER_CORE.zip -d _gmk_run
+          echo "Extracted files:"
+          find _gmk_run -maxdepth 3 -type f -print | sort
           test -f _gmk_run/GMK_HISTORY_DOWNLOADER/download_gmk_history.py
           test -f _gmk_run/GMK_HISTORY_DOWNLOADER/requirements.txt
           test -f _gmk_run/GMK_HISTORY_DOWNLOADER/config.json
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Install dependencies
+        shell: bash
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
-          pip install -r _gmk_run/GMK_HISTORY_DOWNLOADER/requirements.txt
+          python -m pip install -r _gmk_run/GMK_HISTORY_DOWNLOADER/requirements.txt
 
       - name: Download and build GMK data
         id: download
-        continue-on-error: true
         shell: bash
         run: |
-          set +e
+          set -euo pipefail
           cd _gmk_run/GMK_HISTORY_DOWNLOADER
           python download_gmk_history.py
-          code=$?
-          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
-          exit 0
 
       - name: Show generated files
         if: always()
         shell: bash
         run: |
-          find _gmk_run/GMK_HISTORY_DOWNLOADER -maxdepth 3 -type f -print | sort
+          echo "Generated files:"
+          find _gmk_run/GMK_HISTORY_DOWNLOADER -maxdepth 4 -type f -print | sort || true
+
+      - name: Verify output ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f _gmk_run/GMK_HISTORY_DOWNLOADER/GMK_HISTORY_20260901_20261006.zip || {
+            echo "ERROR: Output ZIP was not generated."
+            if [ -f _gmk_run/GMK_HISTORY_DOWNLOADER/output/failures.txt ]; then
+              echo "--- failures.txt ---"
+              cat _gmk_run/GMK_HISTORY_DOWNLOADER/output/failures.txt
+            fi
+            exit 1
+          }
+          ls -lh _gmk_run/GMK_HISTORY_DOWNLOADER/GMK_HISTORY_20260901_20261006.zip
 
       - name: Upload GMK historical data
-        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: GMK_HISTORY_20260901_20261006
@@ -66,10 +91,3 @@ jobs:
             _gmk_run/GMK_HISTORY_DOWNLOADER/output/**
           if-no-files-found: error
           retention-days: 30
-
-      - name: Fail if downloader reported an error
-        if: always() && steps.download.outputs.exit_code != '0'
-        shell: bash
-        run: |
-          echo "Downloader returned exit code ${{ steps.download.outputs.exit_code }}. Artifact was uploaded for inspection."
-          exit 1
