@@ -1,4 +1,4 @@
-name: Build GMK Historical Data
+name: Build GMK Historical Data V4
 
 on:
   workflow_dispatch:
@@ -19,12 +19,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "Repository root:"
-          pwd
-          echo "Repository files:"
-          ls -la
           test -f GMK_HISTORY_DOWNLOADER_CORE.zip || {
-            echo "ERROR: GMK_HISTORY_DOWNLOADER_CORE.zip was not found in the repository root."
+            echo "ERROR: GMK_HISTORY_DOWNLOADER_CORE.zip was not found in repository root."
             exit 1
           }
 
@@ -35,8 +31,6 @@ jobs:
           rm -rf _gmk_run
           mkdir -p _gmk_run
           unzip -q GMK_HISTORY_DOWNLOADER_CORE.zip -d _gmk_run
-          echo "Extracted files:"
-          find _gmk_run -maxdepth 3 -type f -print | sort
           test -f _gmk_run/GMK_HISTORY_DOWNLOADER/download_gmk_history.py
           test -f _gmk_run/GMK_HISTORY_DOWNLOADER/requirements.txt
           test -f _gmk_run/GMK_HISTORY_DOWNLOADER/config.json
@@ -53,41 +47,42 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r _gmk_run/GMK_HISTORY_DOWNLOADER/requirements.txt
 
-      - name: Download and build GMK data
-        id: download
+      - name: Download build and fully validate GMK data
         shell: bash
         run: |
           set -euo pipefail
           cd _gmk_run/GMK_HISTORY_DOWNLOADER
           python download_gmk_history.py
 
-      - name: Show generated files
+      - name: Show validation report
         if: always()
         shell: bash
         run: |
           echo "Generated files:"
-          find _gmk_run/GMK_HISTORY_DOWNLOADER -maxdepth 4 -type f -print | sort || true
+          find _gmk_run/GMK_HISTORY_DOWNLOADER/output -maxdepth 4 -type f -print | sort || true
+          if [ -f _gmk_run/GMK_HISTORY_DOWNLOADER/output/validation_errors.txt ]; then
+            echo "--- validation_errors.txt ---"
+            cat _gmk_run/GMK_HISTORY_DOWNLOADER/output/validation_errors.txt
+          fi
+          if [ -f _gmk_run/GMK_HISTORY_DOWNLOADER/output/missing_minutes.csv ]; then
+            echo "--- first 100 missing minutes ---"
+            head -101 _gmk_run/GMK_HISTORY_DOWNLOADER/output/missing_minutes.csv
+          fi
 
-      - name: Verify output ZIP
+      - name: Verify full validation passed
         shell: bash
         run: |
           set -euo pipefail
-          test -f _gmk_run/GMK_HISTORY_DOWNLOADER/GMK_HISTORY_20260901_20261006.zip || {
-            echo "ERROR: Output ZIP was not generated."
-            if [ -f _gmk_run/GMK_HISTORY_DOWNLOADER/output/failures.txt ]; then
-              echo "--- failures.txt ---"
-              cat _gmk_run/GMK_HISTORY_DOWNLOADER/output/failures.txt
-            fi
-            exit 1
-          }
-          ls -lh _gmk_run/GMK_HISTORY_DOWNLOADER/GMK_HISTORY_20260901_20261006.zip
+          test -f _gmk_run/GMK_HISTORY_DOWNLOADER/output/validation_OK.txt
+          test ! -f _gmk_run/GMK_HISTORY_DOWNLOADER/output/validation_errors.txt
+          test ! -f _gmk_run/GMK_HISTORY_DOWNLOADER/output/missing_minutes.csv
+          grep -q "FULL VALIDATION PASSED" _gmk_run/GMK_HISTORY_DOWNLOADER/output/validation_OK.txt
 
       - name: Upload GMK historical data
         uses: actions/upload-artifact@v4
         with:
           name: GMK_HISTORY_20260901_20261006
-          path: |
-            _gmk_run/GMK_HISTORY_DOWNLOADER/GMK_HISTORY_20260901_20261006.zip
-            _gmk_run/GMK_HISTORY_DOWNLOADER/output/**
+          path: _gmk_run/GMK_HISTORY_DOWNLOADER/output/**
           if-no-files-found: error
           retention-days: 30
+          compression-level: 6
