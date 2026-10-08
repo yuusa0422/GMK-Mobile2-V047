@@ -1,3 +1,35 @@
+name: Build GMK Mobile v0.7.39
+on: [workflow_dispatch, push]
+permissions: {contents: read}
+concurrency: {group: 'gmk-android-${{ github.ref }}', cancel-in-progress: true}
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare production source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import os, re, tempfile, zipfile, subprocess, json, hashlib
+          from pathlib import Path, PurePosixPath
+          root = Path.cwd()
+          archives = [p for pattern in ("GMK_MOBILE_V0739_STREAK_SOURCE_20261008.zip", "GMK_MOBILE_V0739_STREAK_BUNDLE_20261008.zip") for p in root.rglob(pattern) if ".git" not in p.parts]
+          if len(archives) > 1:
+              raise SystemExit("ERROR: multiple production ZIPs; keep exactly one")
+          if archives:
+              data = [p for p in root.rglob("GMK_V0735_TEST_DATA.zip") if ".git" not in p.parts]
+              if len(data) != 1:
+                  raise SystemExit("ERROR: upload exactly one GMK_V0735_TEST_DATA.zip beside the source ZIP")
+              archives += data
+              root = Path(tempfile.mkdtemp(prefix="gmk-", dir=os.environ["RUNNER_TEMP"]))
+              seen = set()
+              for archive in archives:
+                  with zipfile.ZipFile(archive) as z:
+                      if sum(i.file_size for i in z.infolist()) > 256 * 1024 * 1024:
+                          raise SystemExit("ERROR: source ZIP exceeds 256 MiB")
                       for i in z.infolist():
                           p = PurePosixPath(i.filename.replace("\\", "/"))
                           if not p.parts or p.is_absolute() or ".." in p.parts or ":" in str(p):
