@@ -29,24 +29,50 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Locate collector source
+      - name: Extract collector source bundle
         id: collector
-        shell: bash
         run: |
-          mapfile -t matches < <(find . -maxdepth 5 -type f -name collect_crypto_data.py -not -path './.git/*' | sort)
-          if (( ${#matches[@]} != 1 )); then
-            echo "ERROR: expected exactly one collect_crypto_data.py; found ${#matches[@]}"
-            printf '%s\n' "${matches[@]}"
-            exit 1
-          fi
-          project_dir="${matches[0]%/collect_crypto_data.py}"
-          project_dir="${project_dir#./}"
-          if [[ -z "$project_dir" ]]; then project_dir="."; fi
-          if [[ ! -f "$project_dir/test_collect_crypto_data.py" ]]; then
-            echo "ERROR: test_collect_crypto_data.py is missing beside the collector at $project_dir"
-            exit 1
-          fi
-          echo "project_dir=$project_dir" >> "$GITHUB_OUTPUT"
+          python - <<'PY'
+          import os
+          import shutil
+          import stat
+          import zipfile
+          from pathlib import Path
+
+          repo = Path.cwd().resolve()
+          archives = sorted(p for p in repo.glob("GMK_CRYPTO_DATA_GITHUB_202609_202610*.zip") if p.is_file())
+          if not archives:
+              raise SystemExit(
+                  "ERROR: source bundle is missing. Upload GMK_CRYPTO_DATA_GITHUB_202609_202610.zip "
+                  "to the repository root, commit it, then rerun this workflow."
+              )
+          if len(archives) != 1:
+              raise SystemExit(f"ERROR: expected one collector ZIP in repository root; found {len(archives)}")
+
+          runtime = repo / ".gmk_crypto_data_runtime"
+          if runtime.exists():
+              shutil.rmtree(runtime)
+          runtime.mkdir()
+          with zipfile.ZipFile(archives[0]) as archive:
+              for item in archive.infolist():
+                  target = (runtime / item.filename).resolve()
+                  if target != runtime and runtime not in target.parents:
+                      raise SystemExit(f"ERROR: unsafe path in source bundle: {item.filename}")
+                  if stat.S_ISLNK(item.external_attr >> 16):
+                      raise SystemExit(f"ERROR: symbolic link rejected in source bundle: {item.filename}")
+              archive.extractall(runtime)
+
+          sources = list(runtime.rglob("collect_crypto_data.py"))
+          if len(sources) != 1:
+              raise SystemExit(f"ERROR: source ZIP must contain exactly one collector; found {len(sources)}")
+          project = sources[0].parent
+          if not (project / "test_collect_crypto_data.py").is_file():
+              raise SystemExit("ERROR: source ZIP is missing test_collect_crypto_data.py beside the collector")
+          relative = project.relative_to(repo)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"project_dir={relative.as_posix()}\n")
+          print(f"Collector source prepared at {relative}")
+          PY
 
       - name: Run offline tests
         working-directory: ${{ steps.collector.outputs.project_dir }}
