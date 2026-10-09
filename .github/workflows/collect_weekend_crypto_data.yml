@@ -1,0 +1,44 @@
+name: GMK weekend crypto candles (Sep-Oct 2026)
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: First JST calendar date (inclusive)
+        required: true
+        type: string
+        default: "2026-09-01"
+      end_date:
+        description: Last JST calendar date (inclusive; current day is partial)
+        required: true
+        type: string
+        default: "2026-10-10"
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out collector
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run offline tests
+        run: python -m unittest -v
+      - name: Download official public candles
+        env:
+          START_DATE: ${{ inputs.start_date }}
+          END_DATE: ${{ inputs.end_date }}
+        run: python collect_crypto_data.py --start-date "$START_DATE" --end-date "$END_DATE" --output artifacts/crypto-data
+      - name: Upload September/October dataset
+        uses: actions/upload-artifact@v4
+        with:
+          name: GMK_CRYPTO_1M_JST_${{ inputs.start_date }}_${{ inputs.end_date }}
+          path: artifacts/crypto-data/
+          if-no-files-found: error
+          retention-days: 90
