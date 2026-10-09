@@ -1,0 +1,51 @@
+name: GMK Mobile v0.7.42
+on: [workflow_dispatch]
+permissions: {contents: read}
+concurrency: {group: 'gmk-${{ github.ref }}', cancel-in-progress: true}
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      KEYSTORE_B64: ${{ secrets.GMK_SIGNING_KEYSTORE_BASE64 }}
+      STORE_PASSWORD: ${{ secrets.GMK_SIGNING_STORE_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.GMK_SIGNING_KEY_ALIAS }}
+      KEY_PASSWORD: ${{ secrets.GMK_SIGNING_KEY_PASSWORD }}
+      EXPECTED_CERT_SHA256: ${{ secrets.GMK_SIGNING_CERT_SHA256 }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Prepare source and verify inputs
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re, subprocess, zipfile
+          root = pathlib.Path.cwd()
+          helpers = [p for p in root.rglob('tools/build_release.py') if '.git' not in p.parts]
+          stem = 'GMK_MOBILE_V0742_CHART_RANK_PRODUCTION_20261009'
+          archives = [p for p in root.rglob(stem + '*.zip') if '.git' not in p.parts and re.fullmatch(re.escape(stem) + r'(?: ?\([0-9]+\))*\.zip', p.name)]
+          if len(archives) == 1 and not helpers:
+              with zipfile.ZipFile(archives[0]) as z:
+                  items = [i for i in z.infolist() if i.filename.endswith('/tools/build_release.py')]
+                  if len(items) != 1 or items[0].file_size > 1000000: raise SystemExit('ERROR: invalid source helper')
+                  helper = pathlib.Path(os.environ['RUNNER_TEMP']) / 'gmk-build_release.py'
+                  helper.write_bytes(z.read(items[0]))
+          elif len(helpers) == 1 and not archives:
+              helper = helpers[0]
+          else: raise SystemExit('ERROR: keep one v0.7.42 source ZIP or one extracted project')
+          subprocess.run(['python3', str(helper), 'prepare'], check=True)
+          PY
+      - uses: actions/setup-java@v6.0.1
+        with: {distribution: temurin, java-version: '17'}
+      - uses: android-actions/setup-android@v4.0.4
+        with: {cmdline-tools-version: '12266719', packages: 'platform-tools platforms;android-35 build-tools;35.0.0'}
+      - uses: gradle/actions/setup-gradle@v5.0.2
+        with: {gradle-version: '8.10.2'}
+      - name: Test, build and verify APK
+        run: |
+          set -euo pipefail
+          python3 "$GMK_PROJECT/tools/build_release.py" build
+          python3 "$GMK_PROJECT/tools/build_release.py" package
+      - uses: actions/upload-artifact@v6.0.0
+        with: {name: GMK_MOBILE_V0742_APK, path: artifacts/, if-no-files-found: error}
+      - uses: actions/upload-artifact@v6.0.0
+        if: failure()
+        with: {name: GMK-build-diagnostics, path: "gradle-build.log\nbuild-environment.log\n${{ env.GMK_PROJECT }}/app/build/reports/\n${{ env.GMK_PROJECT }}/app/build/test-results/", if-no-files-found: ignore}
