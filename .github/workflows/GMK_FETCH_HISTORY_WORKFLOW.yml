@@ -1,0 +1,116 @@
+name: GMK fetch long history (1-minute)
+# 手動実行: Actions → "GMK fetch long history (1-minute)" → Run workflow
+# 長期検証用。為替はDukascopy(BID)、BTCはbitbank。通貨ごとに別ジョブで並列・低速取得します。
+# Dukascopyが503/タイムアウトを返す日は待って再試行し、それでも取れない日は記録して次へ進みます。
+on:
+  workflow_dispatch:
+    inputs:
+      start_date: {description: '開始日 (YYYY-MM-DD)', required: true, default: '2025-10-01'}
+      end_date: {description: '終了日 (YYYY-MM-DD)', required: true, default: '2026-10-21'}
+permissions: {contents: read}
+env:
+  START_DATE: ${{ inputs.start_date }}
+  END_DATE: ${{ inputs.end_date }}
+  PYTHONUNBUFFERED: '1'
+jobs:
+  fetch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        symbol: [USDJPY, EURJPY, GBPJPY, AUDJPY, NZDJPY, BTCJPY]
+    steps:
+      - name: Fetch ${{ matrix.symbol }}
+        continue-on-error: true
+        timeout-minutes: 320
+        env:
+          SYMBOL: ${{ matrix.symbol }}
+        run: |
+          cat > fetch_history.py <<'PY'
+          import csv, datetime as dt, gzip, json, lzma, os, struct, time, urllib.error, urllib.request
+          from pathlib import Path
+          SYM = os.environ['SYMBOL']; BUDGET = 310 * 60; T0 = time.monotonic()
+          start = dt.date.fromisoformat(os.environ['START_DATE']); end = dt.date.fromisoformat(os.environ['END_DATE'])
+          OUT = Path('hist'); OUT.mkdir(exist_ok=True)
+          report = {'symbol': SYM, 'start': str(start), 'end': str(end), 'days_ok': 0, 'days_empty': 0, 'failed_days': [], 'rows': 0}
+          def log(*a): print(f'[{SYM} {time.monotonic() - T0:7.0f}s]', *a, flush=True)
+          def get(url, binary):
+              waits = [5, 15, 30, 60, 120]
+              last = None
+              for k, w in enumerate(waits):
+                  try:
+                      req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0', 'Accept': '*/*'})
+                      with urllib.request.urlopen(req, timeout=30) as r:
+                          data = r.read()
+                      return data if binary else data.decode()
+                  except urllib.error.HTTPError as e:
+                      if e.code == 404: return None
+                      last = f'HTTP {e.code}'
+                  except Exception as e:
+                      last = f'{type(e).__name__}: {e}'
+                  log('retry', k + 1, 'in', w, 's', last)
+                  time.sleep(w)
+              raise RuntimeError(last)
+          def ok(o, h, l, c): return min(o, h, l, c) > 0 and h >= max(o, c) and l <= min(o, c)
+          path = OUT / f'{SYM}_1m.csv.gz'
+          with gzip.open(path, 'wt', newline='') as f:
+              w = csv.writer(f); w.writerow(['epoch_ms', 'open', 'high', 'low', 'close', 'volume'])
+              day = start
+              while day <= end:
+                  if time.monotonic() - T0 > BUDGET:
+                      log('time budget reached at', day); report['stopped_at'] = str(day); break
+                  rows = []
+                  try:
+                      if SYM == 'BTCJPY':
+                          j = json.loads(get(f'https://public.bitbank.cc/btc_jpy/candlestick/1min/{day:%Y%m%d}', False) or '{}')
+                          for g in ((j.get('data') or {}).get('candlestick') or []):
+                              for a in g.get('ohlcv') or []:
+                                  o, h, l, c, v, ms = float(a[0]), float(a[1]), float(a[2]), float(a[3]), float(a[4]), int(a[5])
+                                  if ok(o, h, l, c): rows.append((ms, o, h, l, c, v))
+                          time.sleep(0.5)
+                      elif day.weekday() != 5:  # Dukascopy: no Saturday (UTC) data
+                          url = f'https://datafeed.dukascopy.com/datafeed/{SYM}/{day.year}/{day.month - 1:02d}/{day.day:02d}/BID_candles_min_1.bi5'
+                          raw = get(url, True)
+                          if raw:
+                              data = lzma.decompress(raw)
+                              base = dt.datetime.combine(day, dt.time(0), dt.timezone.utc).timestamp()
+                              for k in range(0, len(data) - 23, 24):
+                                  sec, o, c, l, h, v = struct.unpack('>5if', data[k:k + 24])
+                                  vals = (o / 1000.0, h / 1000.0, l / 1000.0, c / 1000.0)
+                                  if 0 <= sec < 86400 and v > 0 and ok(*vals):
+                                      rows.append((int((base + sec) * 1000), *vals, float(v)))
+                          time.sleep(1.0)
+                      for r in rows: w.writerow(r)
+                      report['rows'] += len(rows)
+                      report['days_ok' if rows else 'days_empty'] += 1
+                      if day.day == 1 or not rows: log(day, len(rows), 'bars')
+                  except Exception as e:
+                      report['failed_days'].append(str(day)); log('FAILED', day, e)
+                  day += dt.timedelta(days=1)
+          (OUT / f'report_{SYM}.json').write_text(json.dumps(report, indent=1) + '\n')
+          log('done', json.dumps({k: v for k, v in report.items() if k != 'failed_days'}), 'failed days:', len(report['failed_days']))
+          PY
+          python3 fetch_history.py
+      - uses: actions/upload-artifact@v6.0.0
+        if: always()
+        with:
+          name: part_${{ matrix.symbol }}
+          path: hist/
+          if-no-files-found: warn
+  collect:
+    needs: fetch
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with: {pattern: 'part_*', path: hist, merge-multiple: true}
+      - name: Summary
+        run: |
+          ls -la hist
+          for f in hist/report_*.json; do python3 -c "import json,sys;r=json.load(open(sys.argv[1]));print(r['symbol'],'rows',r['rows'],'days_ok',r['days_ok'],'empty',r['days_empty'],'failed',len(r['failed_days']),r.get('stopped_at',''))" "$f"; done
+      - uses: actions/upload-artifact@v6.0.0
+        with:
+          name: GMK_HISTORY_${{ inputs.start_date }}_${{ inputs.end_date }}
+          path: hist/
