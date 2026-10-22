@@ -1,0 +1,160 @@
+name: GMK fetch 1-minute candles
+# 手動実行: Actions → "GMK fetch 1-minute candles" → Run workflow
+# 取得元: Yahoo Finance(アプリと同じ為替) / bitbank(アプリと同じBTC) / Dukascopy(照合用の為替BID)
+# 土日はBTC(bitbank)のみ意味があります(為替は休場)。毎日の取得範囲は 00:00〜翌05:30 JST。
+# 注意: Yahooの1分足は「直近30日」までしか取得できません。古い日から順に消えていきます。
+on:
+  workflow_dispatch:
+    inputs:
+      start_date: {description: '開始日 JST (YYYY-MM-DD)', required: true, default: '2026-10-01'}
+      end_date: {description: '終了日 JST (YYYY-MM-DD, この日を含む)', required: true, default: '2026-10-22'}
+      sources: {description: '取得元 (カンマ区切り: yahoo,bitbank,dukascopy)', required: true, default: 'yahoo,bitbank,dukascopy'}
+permissions: {contents: read}
+jobs:
+  fetch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Fetch candles
+        env:
+          START_DATE: ${{ inputs.start_date }}
+          END_DATE: ${{ inputs.end_date }}
+          SOURCES: ${{ inputs.sources }}
+        run: |
+          python3 - <<'PY'
+          import csv, datetime as dt, hashlib, json, lzma, os, struct, time, urllib.error, urllib.request
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+
+          JST = ZoneInfo('Asia/Tokyo'); UTC = dt.timezone.utc
+          start = dt.date.fromisoformat(os.environ['START_DATE']); end = dt.date.fromisoformat(os.environ['END_DATE'])
+          if end < start: raise SystemExit('end_date must be >= start_date')
+          sources = {s.strip().lower() for s in os.environ['SOURCES'].split(',') if s.strip()}
+          OUT = Path('gmk_m1'); OUT.mkdir(exist_ok=True)
+          YAHOO = {'USDJPY': 'JPY=X', 'EURJPY': 'EURJPY=X', 'GBPJPY': 'GBPJPY=X', 'AUDJPY': 'AUDJPY=X', 'NZDJPY': 'NZDJPY=X'}
+          FX = list(YAHOO)
+          report = {'requested': {'start_jst': str(start), 'end_jst': str(end), 'sources': sorted(sources)},
+                    'generated_utc': dt.datetime.now(UTC).isoformat(timespec='seconds'), 'files': {}, 'errors': [], 'coverage': {}}
+          # JST range [start 00:00, end+1 05:30): covers the last night session (09:00 -> 05:00) and the
+          # 06:00-09:00 history the app needs for its 120-bar context. Future minutes are simply absent.
+          t0 = dt.datetime.combine(start, dt.time(0), JST)
+          t1 = min(dt.datetime.combine(end + dt.timedelta(days=1), dt.time(5, 30), JST), dt.datetime.now(JST))
+
+          def get(url, attempts=4, binary=False):
+              last = None
+              for k in range(attempts):
+                  try:
+                      req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (GMK research fetch)'})
+                      with urllib.request.urlopen(req, timeout=60) as r:
+                          data = r.read()
+                      return data if binary else data.decode('utf-8')
+                  except urllib.error.HTTPError as e:
+                      last = f'HTTP {e.code}'
+                      if e.code == 404: return None
+                  except Exception as e:
+                      last = f'{type(e).__name__}: {e}'
+                  time.sleep(2 * (k + 1))
+              raise RuntimeError(f'{url} -> {last}')
+
+          def write(source, symbol, rows, suffix='1m_JST'):
+              rows = sorted({r[0]: r for r in rows if t0.timestamp() * 1000 <= r[0] < t1.timestamp() * 1000}.values())
+              path = OUT / source / f'{symbol}_{suffix}.csv'; path.parent.mkdir(exist_ok=True)
+              with path.open('w', newline='') as f:
+                  w = csv.writer(f); w.writerow(['time_jst', 'epoch_ms', 'open', 'high', 'low', 'close', 'volume'])
+                  for ms, o, h, l, c, v in rows:
+                      w.writerow([dt.datetime.fromtimestamp(ms / 1000, JST).isoformat(), ms, repr(o), repr(h), repr(l), repr(c), repr(v)])
+              report['files'][str(path.relative_to(OUT))] = {'rows': len(rows), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+              # Coverage per app session (09:00 -> next day 05:00 JST = 1200 minutes).
+              # FX sessions start Mon-Fri; BTC trades every day (weekend sessions are BTC only in the app).
+              cov = {}
+              day = start
+              while day <= end:
+                  if symbol == 'BTCJPY' or day.weekday() < 5:
+                      a = dt.datetime.combine(day, dt.time(9), JST).timestamp() * 1000
+                      b = dt.datetime.combine(day + dt.timedelta(days=1), dt.time(5), JST).timestamp() * 1000
+                      h0 = dt.datetime.combine(day, dt.time(6), JST).timestamp() * 1000
+                      cov[str(day)] = {'weekday': day.strftime('%a'), 'bars_session_09_05': sum(1 for r in rows if a <= r[0] < b),
+                                       'expected_session': 1200, 'bars_06_09': sum(1 for r in rows if h0 <= r[0] < a)}
+                  day += dt.timedelta(days=1)
+              report['coverage'][f'{source}/{symbol}'] = cov
+              print(f'{source:9s} {symbol}: {len(rows)} bars')
+              return rows
+
+          def ok(o, h, l, c):
+              return all(x is not None and x == x and x > 0 for x in (o, h, l, c)) and h >= max(o, c) and l <= min(o, c)
+
+          yahoo_close = {}
+          if 'yahoo' in sources:
+              for sym, ys in YAHOO.items():
+                  rows = []
+                  p = t0
+                  while p < t1:  # Yahoo allows at most ~7 days of 1m data per request.
+                      q = min(p + dt.timedelta(days=5), t1)
+                      url = (f'https://query1.finance.yahoo.com/v8/finance/chart/{ys}?interval=1m&includePrePost=true'
+                             f'&events=history&period1={int(p.timestamp())}&period2={int(q.timestamp())}')
+                      try:
+                          j = json.loads(get(url) or '{}')
+                          err = (j.get('chart') or {}).get('error')
+                          if err: raise RuntimeError(json.dumps(err, ensure_ascii=False))
+                          res = ((j.get('chart') or {}).get('result') or [None])[0] or {}
+                          ts = res.get('timestamp') or []
+                          qd = ((res.get('indicators') or {}).get('quote') or [{}])[0]
+                          for i, t in enumerate(ts):
+                              vals = [qd.get(k, [None] * len(ts))[i] for k in ('open', 'high', 'low', 'close')]
+                              vol = (qd.get('volume') or [0] * len(ts))[i] or 0
+                              if ok(*vals) and t % 60 == 0: rows.append((t * 1000, *[float(x) for x in vals], float(vol)))
+                      except Exception as e:
+                          report['errors'].append({'source': 'yahoo', 'symbol': sym, 'from': p.isoformat(), 'to': q.isoformat(), 'error': str(e)[:400]})
+                      p = q; time.sleep(1.0)
+                  rows = write('yahoo', sym, rows)
+                  if rows: yahoo_close[sym] = sorted(r[4] for r in rows)[len(rows) // 2]
+
+          if 'bitbank' in sources:
+              rows = []
+              day = start
+              while day <= t1.date():  # includes the morning after end_date (night session until 05:00)
+                  try:
+                      j = json.loads(get(f'https://public.bitbank.cc/btc_jpy/candlestick/1min/{day:%Y%m%d}') or '{}')
+                      for g in ((j.get('data') or {}).get('candlestick') or []):
+                          for a in g.get('ohlcv') or []:
+                              o, h, l, c, v, ms = float(a[0]), float(a[1]), float(a[2]), float(a[3]), float(a[4]), int(a[5])
+                              if ok(o, h, l, c): rows.append((ms, o, h, l, c, v))
+                  except Exception as e:
+                      report['errors'].append({'source': 'bitbank', 'date': str(day), 'error': str(e)[:400]})
+                  day += dt.timedelta(days=1); time.sleep(0.5)
+              write('bitbank', 'BTCJPY', rows)
+
+          if 'dukascopy' in sources:
+              for sym in FX:
+                  rows = []; scale = None
+                  day = t0.astimezone(UTC).date()
+                  while day <= t1.astimezone(UTC).date():
+                      # Dukascopy month is zero-based. Each record: int32 sec-of-day, open, close, low, high (scaled ints), float32 volume.
+                      url = f'https://datafeed.dukascopy.com/datafeed/{sym}/{day.year}/{day.month - 1:02d}/{day.day:02d}/BID_candles_min_1.bi5'
+                      try:
+                          raw = get(url, binary=True)
+                          if raw:
+                              data = lzma.decompress(raw)
+                              base = dt.datetime.combine(day, dt.time(0), UTC).timestamp()
+                              for k in range(0, len(data) - 23, 24):
+                                  sec, o, c, l, h, v = struct.unpack('>5if', data[k:k + 24])
+                                  if scale is None:
+                                      ref = yahoo_close.get(sym)
+                                      scale = min((1000.0, 100000.0), key=lambda s: abs(o / s - ref)) if ref else 1000.0
+                                  vals = (o / scale, h / scale, l / scale, c / scale)
+                                  if 0 <= sec < 86400 and v > 0 and ok(*vals):  # zero-volume rows are filler for closed minutes
+                                      rows.append((int((base + sec) * 1000), *vals, float(v)))
+                      except Exception as e:
+                          report['errors'].append({'source': 'dukascopy', 'symbol': sym, 'date': str(day), 'error': str(e)[:400]})
+                      day += dt.timedelta(days=1); time.sleep(0.3)
+                  write('dukascopy', sym, rows, 'BID_1m_JST')
+
+          (OUT / 'report.json').write_text(json.dumps(report, ensure_ascii=False, indent=1) + '\n')
+          print(json.dumps({'files': {k: v['rows'] for k, v in report['files'].items()}, 'errors': len(report['errors'])}, ensure_ascii=False, indent=1))
+          if not any(v['rows'] for v in report['files'].values()): raise SystemExit('No candles fetched; see report.json errors')
+          PY
+      - uses: actions/upload-artifact@v6.0.0
+        with:
+          name: GMK_M1_${{ inputs.start_date }}_${{ inputs.end_date }}
+          path: gmk_m1/
+          if-no-files-found: error
