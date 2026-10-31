@@ -1,0 +1,204 @@
+name: GMK fetch crypto 1-minute candles
+# 手動実行: Actions → "GMK fetch crypto 1-minute candles" → Run workflow
+# ザオプションの仮想通貨（BTC/JPY・ETH/JPY・BTC/USD・ETH/USD）を研究するための1分足を1年分取得します。
+# v2 (2026-10-31): ザオプションのBTC/JPYはbitbankと値も動きも違う（取引履歴で確認）ため、ザオプションの価格の元を
+#   探せるように取得元を増やしました。どの取得元がザオプションの価格に一番近いかを取引履歴で照合します。
+#   bitbank   : btc_jpy / eth_jpy（今のアプリのBTCの取得元）
+#   binance   : BTCUSDT / ETHUSDT（data.binance.vision の月別/日別ファイル）
+#   coinbase  : BTC-USD / ETH-USD（常に取得）
+#   gmo       : GMOコイン BTC / ETH（現物）/ BTC_JPY（レバレッジ）
+# 取得元ごとに別ステップ・別の制限時間。1つが失敗しても他は続行し、取れた分は必ず保存されます。
+on:
+  workflow_dispatch:
+    inputs:
+      start_date: {description: '開始日 JST (YYYY-MM-DD)', required: true, default: '2025-10-01'}
+      end_date: {description: '終了日 JST (YYYY-MM-DD, この日を含む)', required: true, default: '2026-10-31'}
+permissions: {contents: read}
+env:
+  START_DATE: ${{ inputs.start_date }}
+  END_DATE: ${{ inputs.end_date }}
+  PYTHONUNBUFFERED: '1'
+jobs:
+  fetch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - name: Write fetch script
+        run: |
+          cat > fetch_crypto.py <<'PY'
+          import csv, datetime as dt, gzip, hashlib, io, json, os, sys, time, urllib.error, urllib.request, zipfile
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+
+          SOURCE = sys.argv[1]
+          BUDGET = float(sys.argv[2]) * 60
+          T_START = time.monotonic()
+          JST = ZoneInfo('Asia/Tokyo'); UTC = dt.timezone.utc
+          start = dt.date.fromisoformat(os.environ['START_DATE']); end = dt.date.fromisoformat(os.environ['END_DATE'])
+          t0 = dt.datetime.combine(start, dt.time(0), JST)
+          t1 = min(dt.datetime.combine(end + dt.timedelta(days=1), dt.time(0), JST), dt.datetime.now(JST))
+          T0MS = int(t0.timestamp() * 1000); T1MS = int(t1.timestamp() * 1000)
+          OUT = Path('gmk_crypto'); OUT.mkdir(exist_ok=True)
+          report = {'source': SOURCE, 'start_jst': str(start), 'end_jst': str(end), 'files': {}, 'errors': [], 'requests': 0, 'budget_exhausted': False}
+
+          def log(*a): print(f'[{SOURCE} {time.monotonic() - T_START:6.0f}s]', *a, flush=True)
+          def out_of_time(): return time.monotonic() - T_START > BUDGET
+          def save_report(): (OUT / f'report_{SOURCE}.json').write_text(json.dumps(report, ensure_ascii=False, indent=1) + '\n')
+
+          def get(url, binary=False, attempts=4, timeout=30):
+              last = None
+              for k in range(attempts):
+                  if out_of_time(): raise RuntimeError('time budget exhausted')
+                  report['requests'] += 1
+                  try:
+                      req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0', 'Accept': '*/*'})
+                      with urllib.request.urlopen(req, timeout=timeout) as r:
+                          data = r.read()
+                      return data if binary else data.decode('utf-8')
+                  except urllib.error.HTTPError as e:
+                      last = f'HTTP {e.code}'
+                      if e.code == 404: return None
+                      if e.code == 429: time.sleep(10)
+                  except Exception as e:
+                      last = f'{type(e).__name__}: {e}'
+                  log('retry', k + 1, last, url[:140])
+                  time.sleep(2 * (k + 1))
+              raise RuntimeError(f'{last} ({url[:160]})')
+
+          def ok(o, h, l, c):
+              return all(x is not None and x == x and x > 0 for x in (o, h, l, c)) and h >= max(o, c) and l <= min(o, c)
+
+          def write(symbol, rows):
+              rows = sorted({r[0]: r for r in rows if T0MS <= r[0] < T1MS}.values())
+              path = OUT / SOURCE / f'{symbol}_1m.csv.gz'; path.parent.mkdir(exist_ok=True)
+              with gzip.open(path, 'wt', newline='') as f:
+                  w = csv.writer(f); w.writerow(['epoch_ms', 'open', 'high', 'low', 'close', 'volume'])
+                  for ms, o, h, l, c, v in rows: w.writerow([ms, repr(o), repr(h), repr(l), repr(c), repr(v)])
+              days = {}
+              for r in rows:
+                  d = dt.datetime.fromtimestamp(r[0] / 1000, JST).date().isoformat(); days[d] = days.get(d, 0) + 1
+              report['files'][str(path.relative_to(OUT))] = {'rows': len(rows), 'bytes': path.stat().st_size, 'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                                                             'days': len(days), 'short_days': {d: n for d, n in days.items() if n < 1300}}
+              log(f'{symbol}: {len(rows)} bars saved ({path.stat().st_size / 1e6:.1f} MB)')
+              save_report()
+
+          def have(symbol, source):
+              r = json.loads((OUT / f'report_{source}.json').read_text()) if (OUT / f'report_{source}.json').exists() else {}
+              f = (r.get('files') or {}).get(f'{source}/{symbol}_1m.csv.gz')
+              return bool(f) and f['rows'] > 0.9 * (T1MS - T0MS) / 60000
+
+          try:
+              if SOURCE == 'bitbank':
+                  for pair, sym in (('eth_jpy', 'ETHJPY'), ('btc_jpy', 'BTCJPY')):
+                      rows = []; day = t0.astimezone(UTC).date()
+                      while day <= t1.astimezone(UTC).date() and not out_of_time():   # files are UTC days, weekends included
+                          try:
+                              j = json.loads(get(f'https://public.bitbank.cc/{pair}/candlestick/1min/{day:%Y%m%d}') or '{}')
+                              n0 = len(rows)
+                              for g in ((j.get('data') or {}).get('candlestick') or []):
+                                  for a in g.get('ohlcv') or []:
+                                      o, h, l, c, v, ms = float(a[0]), float(a[1]), float(a[2]), float(a[3]), float(a[4]), int(a[5])
+                                      if ok(o, h, l, c): rows.append((ms, o, h, l, c, v))
+                              if day.day == 1 or len(rows) == n0: log(sym, day, f'+{len(rows) - n0} bars')
+                          except Exception as e:
+                              report['errors'].append({'symbol': sym, 'date': str(day), 'error': str(e)[:300]}); log('ERROR', sym, day, e)
+                          day += dt.timedelta(days=1); time.sleep(0.3)
+                      write(sym, rows)
+
+              elif SOURCE == 'binance':
+                  base = 'https://data.binance.vision/data/spot'
+                  for pair, sym in (('BTCUSDT', 'BTCUSD'), ('ETHUSDT', 'ETHUSD')):
+                      rows = []
+                      first = dt.date(t0.astimezone(UTC).year, t0.astimezone(UTC).month, 1); last = t1.astimezone(UTC).date()
+                      m = first
+                      while m <= last and not out_of_time():
+                          nxt = (m.replace(day=28) + dt.timedelta(days=4)).replace(day=1)
+                          files = []
+                          if nxt <= last: files.append(f'{base}/monthly/klines/{pair}/1m/{pair}-1m-{m:%Y-%m}.zip')
+                          else:   # current month: daily files
+                              d = m
+                              while d <= last: files.append(f'{base}/daily/klines/{pair}/1m/{pair}-1m-{d:%Y-%m-%d}.zip'); d += dt.timedelta(days=1)
+                          for url in files:
+                              try:
+                                  raw = get(url, binary=True)
+                                  if raw is None: report['errors'].append({'symbol': sym, 'url': url, 'error': '404'}); continue
+                                  n0 = len(rows)
+                                  with zipfile.ZipFile(io.BytesIO(raw)) as z:
+                                      for name in z.namelist():
+                                          for line in z.read(name).decode().splitlines():
+                                              p = line.split(',')
+                                              if len(p) < 6 or not p[0].strip().isdigit(): continue
+                                              ts = int(p[0]); ts = ts // 1000 if ts > 10 ** 14 else ts      # 2025+ files are in microseconds
+                                              o, h, l, c, v = (float(x) for x in p[1:6])
+                                              if ok(o, h, l, c): rows.append((ts, o, h, l, c, v))
+                                  log(sym, url.rsplit('/', 1)[1], f'+{len(rows) - n0} bars')
+                              except Exception as e:
+                                  report['errors'].append({'symbol': sym, 'url': url, 'error': str(e)[:300]}); log('ERROR', sym, url, e)
+                          m = nxt
+                      write(sym, rows)
+
+              elif SOURCE == 'coinbase':
+                  for product, sym in (('BTC-USD', 'BTCUSD'), ('ETH-USD', 'ETHUSD')):
+                      rows = []; p = t0.astimezone(UTC)
+                      while p < t1 and not out_of_time():
+                          q = min(p + dt.timedelta(minutes=300), t1)
+                          url = (f'https://api.exchange.coinbase.com/products/{product}/candles?granularity=60'
+                                 f'&start={p.strftime("%Y-%m-%dT%H:%M:%SZ")}&end={q.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")}')
+                          try:
+                              for a in json.loads(get(url) or '[]'):
+                                  ts, lo, hi, op, cl, vol = int(a[0]), float(a[1]), float(a[2]), float(a[3]), float(a[4]), float(a[5])
+                                  if ok(op, hi, lo, cl): rows.append((ts * 1000, op, hi, lo, cl, vol))
+                          except Exception as e:
+                              report['errors'].append({'symbol': sym, 'from': p.isoformat(), 'error': str(e)[:300]}); log('ERROR', sym, p, e)
+                          if p.minute == 0 and p.hour == 0: log(sym, p.date(), len(rows))
+                          p = q; time.sleep(0.25)
+                      write(sym, rows)
+
+              elif SOURCE == 'gmo':
+                  # GMO Coin public klines: one request per date (YYYYMMDD; the day starts 06:00 JST), rows outside the range are dropped
+                  for symbol, sym in (('BTC', 'BTCJPY'), ('ETH', 'ETHJPY'), ('BTC_JPY', 'BTCJPY_LEV')):
+                      rows = []; day = (t0 - dt.timedelta(days=1)).date()
+                      while day <= t1.date() and not out_of_time():
+                          try:
+                              j = json.loads(get(f'https://api.coin.z.com/public/v1/klines?symbol={symbol}&interval=1min&date={day:%Y%m%d}') or '{}')
+                              n0 = len(rows)
+                              for a in (j.get('data') or []):
+                                  o, h, l, c = float(a['open']), float(a['high']), float(a['low']), float(a['close'])
+                                  if ok(o, h, l, c): rows.append((int(a['openTime']), o, h, l, c, float(a.get('volume') or 0)))
+                              if day.day == 1 or len(rows) == n0: log(sym, day, f'+{len(rows) - n0} bars', 'status', j.get('status'))
+                          except Exception as e:
+                              report['errors'].append({'symbol': sym, 'date': str(day), 'error': str(e)[:300]}); log('ERROR', sym, day, e)
+                          day += dt.timedelta(days=1); time.sleep(0.35)
+                      write(sym, rows)
+          finally:
+              report['budget_exhausted'] = out_of_time()
+              save_report()
+              log('done', json.dumps({k: v['rows'] for k, v in report['files'].items()}), 'errors', len(report['errors']))
+          PY
+      - name: Fetch bitbank (ETH/JPY, BTC/JPY)
+        continue-on-error: true
+        timeout-minutes: 35
+        run: python3 fetch_crypto.py bitbank 32
+      - name: Fetch Binance (BTC/USD, ETH/USD reference)
+        continue-on-error: true
+        timeout-minutes: 15
+        run: python3 fetch_crypto.py binance 12
+      - name: Fetch Coinbase (BTC-USD, ETH-USD)
+        continue-on-error: true
+        timeout-minutes: 45
+        run: python3 fetch_crypto.py coinbase 42
+      - name: Fetch GMO Coin (BTC, ETH, BTC_JPY)
+        continue-on-error: true
+        timeout-minutes: 30
+        run: python3 fetch_crypto.py gmo 27
+      - name: Summary
+        if: always()
+        run: |
+          ls -lR gmk_crypto || true
+          for f in gmk_crypto/report_*.json; do echo "== $f"; python3 -c "import json,sys;r=json.load(open(sys.argv[1]));print({k:(v['rows'],v['days']) for k,v in r['files'].items()}, 'errors:', len(r['errors']), 'budget_exhausted:', r['budget_exhausted']); [print(' ', e) for e in r['errors'][:5]]" "$f"; done
+      - uses: actions/upload-artifact@v6.0.0
+        if: always()
+        with:
+          name: GMK_CRYPTO_M1_${{ inputs.start_date }}_${{ inputs.end_date }}
+          path: gmk_crypto/
+          if-no-files-found: warn

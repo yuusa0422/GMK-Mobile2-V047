@@ -1,0 +1,116 @@
+name: GMK fetch world markets 1-minute
+# 手動実行: Actions → "GMK fetch world markets 1-minute" → Run workflow
+# v0.7.57 の平日研究用。円クロス以外の世界の市場（ドルストレート・株価指数・米国債など・金・原油・ドル指数・VIX）の
+# 1分足を1年分、Dukascopy から取得します。「世界の市場の直前の動きが、円クロスの次の3分を先取りしているか」を調べます。
+# グループごとに別ジョブで並列に取得。取れなかった銘柄（Dukascopyに無い名前など）は記録して次へ進みます。
+on:
+  workflow_dispatch:
+    inputs:
+      start_date: {description: '開始日 UTC (YYYY-MM-DD)', required: true, default: '2025-09-29'}
+      end_date: {description: '終了日 UTC (YYYY-MM-DD, この日を含む)', required: true, default: '2026-10-31'}
+permissions: {contents: read}
+env:
+  START_DATE: ${{ inputs.start_date }}
+  END_DATE: ${{ inputs.end_date }}
+  PYTHONUNBUFFERED: '1'
+jobs:
+  fetch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 200
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        group:
+          - {name: fx_majors, symbols: 'EURUSD GBPUSD AUDUSD NZDUSD USDCHF USDCAD'}
+          - {name: fx_other, symbols: 'EURGBP EURCHF USDCNH USDSGD USDMXN'}
+          - {name: metals_energy, symbols: 'XAUUSD XAGUSD BRENTCMDUSD LIGHTCMDUSD'}
+          - {name: indices_jp_us, symbols: 'JPNIDXJPY USA500IDXUSD USATECHIDXUSD USA30IDXUSD'}
+          - {name: indices_other, symbols: 'DEUIDXEUR GBRIDXGBP HKGIDXHKD AUSIDXAUD CHIIDXUSD'}
+          - {name: rates_dollar_vol, symbols: 'USTBONDTRUSD BUNDTREUR UKGILTTRGBP DOLLARIDXUSD VOLIDXUSD'}
+    steps:
+      - name: Fetch ${{ matrix.group.name }}
+        continue-on-error: true
+        timeout-minutes: 190
+        env:
+          SYMBOLS: ${{ matrix.group.symbols }}
+          GROUP: ${{ matrix.group.name }}
+        run: |
+          cat > world.py <<'PY'
+          import csv, datetime as dt, gzip, hashlib, json, lzma, os, struct, time, urllib.error, urllib.request
+          from pathlib import Path
+          SYMS = os.environ['SYMBOLS'].split(); GROUP = os.environ['GROUP']; BUDGET = 180 * 60; T0 = time.monotonic()
+          UTC = dt.timezone.utc
+          start = dt.date.fromisoformat(os.environ['START_DATE']); end = dt.date.fromisoformat(os.environ['END_DATE'])
+          OUT = Path('world'); OUT.mkdir(exist_ok=True)
+          report = {'group': GROUP, 'start': str(start), 'end': str(end), 'files': {}, 'errors': [], 'missing_symbols': [], 'requests': 0}
+          def log(*a): print(f'[{GROUP} {time.monotonic() - T0:6.0f}s]', *a, flush=True)
+          def out_of_time(): return time.monotonic() - T0 > BUDGET
+          def get(url):
+              last = None
+              for k, w in enumerate([3, 10, 30]):
+                  if out_of_time(): raise RuntimeError('time budget exhausted')
+                  report['requests'] += 1
+                  try:
+                      req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0', 'Accept': '*/*'})
+                      with urllib.request.urlopen(req, timeout=30) as r: return r.read()
+                  except urllib.error.HTTPError as e:
+                      if e.code == 404: return None
+                      last = f'HTTP {e.code}'
+                  except Exception as e: last = f'{type(e).__name__}: {e}'
+                  log('retry', k + 1, last, url[-60:]); time.sleep(w)
+              raise RuntimeError(last)
+          for sym in SYMS:
+              rows = []; empty = 0; day = start; days_ok = 0
+              while day <= end and not out_of_time():
+                  if day.weekday() == 5: day += dt.timedelta(days=1); continue
+                  url = f'https://datafeed.dukascopy.com/datafeed/{sym}/{day.year}/{day.month - 1:02d}/{day.day:02d}/BID_candles_min_1.bi5'
+                  try:
+                      raw = get(url)
+                      if raw:
+                          data = lzma.decompress(raw); base = dt.datetime.combine(day, dt.time(0), UTC).timestamp(); n0 = len(rows)
+                          for k in range(0, len(data) - 23, 24):
+                              sec, o, c, l, h, v = struct.unpack('>5if', data[k:k + 24])
+                              if 0 <= sec < 86400 and o > 0 and c > 0 and h >= max(o, c) and l <= min(o, c):
+                                  rows.append((int((base + sec) * 1000), o, h, l, c, v))
+                          days_ok += len(rows) > n0
+                      else: empty += 1
+                  except Exception as e:
+                      report['errors'].append({'symbol': sym, 'date': str(day), 'error': str(e)[:200]}); log('ERROR', sym, day, e)
+                  if day.day == 1: log(sym, day, len(rows), 'bars')
+                  if days_ok == 0 and empty >= 15: log(sym, 'no data for 15 days - symbol skipped'); report['missing_symbols'].append(sym); break
+                  day += dt.timedelta(days=1); time.sleep(0.15)
+              if not rows: continue
+              # prices are Dukascopy's scaled integers (point size differs by instrument); returns do not depend on the scale
+              path = OUT / f'{sym}_1m_raw.csv.gz'
+              with gzip.open(path, 'wt', newline='') as f:
+                  w = csv.writer(f); w.writerow(['epoch_ms', 'open', 'high', 'low', 'close', 'volume'])
+                  for r in sorted(set(rows)): w.writerow(r)
+              report['files'][path.name] = {'rows': len(rows), 'days_with_data': days_ok, 'first_close_raw': rows[0][4], 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+              log(sym, 'saved', len(rows), 'bars', days_ok, 'days')
+              (OUT / f'report_{GROUP}.json').write_text(json.dumps(report, indent=1) + '\n')
+          (OUT / f'report_{GROUP}.json').write_text(json.dumps(report, indent=1) + '\n')
+          log('done', json.dumps({k: v['rows'] for k, v in report['files'].items()}), 'missing', report['missing_symbols'], 'errors', len(report['errors']))
+          PY
+          python3 world.py
+      - uses: actions/upload-artifact@v6.0.0
+        if: always()
+        with:
+          name: world_${{ matrix.group.name }}
+          path: world/
+          if-no-files-found: warn
+  collect:
+    needs: fetch
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with: {pattern: 'world_*', path: world, merge-multiple: true}
+      - name: Summary
+        run: |
+          ls -la world
+          for f in world/report_*.json; do python3 -c "import json,sys;r=json.load(open(sys.argv[1]));print(r['group'],{k:(v['rows'],v['days_with_data']) for k,v in r['files'].items()},'missing',r['missing_symbols'],'errors',len(r['errors']))" "$f"; done
+      - uses: actions/upload-artifact@v6.0.0
+        with:
+          name: GMK_WORLD_M1_${{ inputs.start_date }}_${{ inputs.end_date }}
+          path: world/

@@ -1,0 +1,135 @@
+name: GMK fetch tick samples full year (seconds before entry)
+# 手動実行: Actions → "GMK fetch tick samples full year (seconds before entry)" → Run workflow
+# v0.7.57 の平日研究用（1年分）。各5分枠(日本時間9:00〜22:55)のエントリー前120秒〜判定後までの価格を秒単位で記録します。
+# 為替5通貨: Dukascopy のティック(買値・売値の中値)。ザオプションの為替の値はこの中値に近い（取引履歴で確認、差0.5銭程度）。
+# BTCはザオプションの価格がbitbankと違うため取りません（仮想通貨は別のワークフローで価格の元を特定します）。
+# エントリーが数秒遅れた場合（取引履歴では枠の開始から中央値7秒）の勝ち負けも調べられるよう、+1〜+15秒と+181〜+195秒も記録します。
+# 出力は小さなCSV(通貨ごと)だけで、ZIPを1つダウンロードしてチャットに添付すれば検証できます。
+on:
+  workflow_dispatch:
+    inputs:
+      start_date: {description: '開始日 (YYYY-MM-DD)', required: true, default: '2025-10-01'}
+      end_date: {description: '終了日 (YYYY-MM-DD)', required: true, default: '2026-10-31'}
+permissions: {contents: read}
+env:
+  START_DATE: ${{ inputs.start_date }}
+  END_DATE: ${{ inputs.end_date }}
+  PYTHONUNBUFFERED: '1'
+jobs:
+  fetch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        symbol: [USDJPY, EURJPY, GBPJPY, AUDJPY, NZDJPY]
+    steps:
+      - name: Sample ${{ matrix.symbol }}
+        continue-on-error: true
+        timeout-minutes: 340
+        env:
+          SYMBOL: ${{ matrix.symbol }}
+        run: |
+          cat > ticks.py <<'PY'
+          import bisect, csv, datetime as dt, gzip, json, lzma, os, struct, time, urllib.error, urllib.request
+          from pathlib import Path
+          SYM = os.environ['SYMBOL']; BUDGET = 330 * 60; T0 = time.monotonic()
+          JST = dt.timezone(dt.timedelta(hours=9)); UTC = dt.timezone.utc
+          start = dt.date.fromisoformat(os.environ['START_DATE']); end = dt.date.fromisoformat(os.environ['END_DATE'])
+          OFFS = [-120, -90, -60, -45, -30, -20, -15, -12, -10, -8, -5, -3, -2, -1, 0, 1, 2, 3, 5, 7, 10, 15, 60, 120, 170, 175, 179, 180, 181, 182, 183, 185, 187, 190, 195]
+          OUT = Path('ticks'); OUT.mkdir(exist_ok=True)
+          report = {'symbol': SYM, 'start': str(start), 'end': str(end), 'slots': 0, 'files_ok': 0, 'files_empty': 0, 'failed': []}
+          def log(*a): print(f'[{SYM} {time.monotonic() - T0:7.0f}s]', *a, flush=True)
+          def get(url):
+              last = None
+              for k, w in enumerate([5, 15, 30, 60, 120]):
+                  try:
+                      req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0', 'Accept': '*/*'})
+                      with urllib.request.urlopen(req, timeout=40) as r: return r.read()
+                  except urllib.error.HTTPError as e:
+                      if e.code == 404: return None
+                      last = f'HTTP {e.code}'
+                  except Exception as e: last = f'{type(e).__name__}: {e}'
+                  log('retry', k + 1, 'in', w, 's', last); time.sleep(w)
+              raise RuntimeError(last)
+          def boundaries(day):
+              for h in range(9, 23):
+                  for m in range(0, 60, 5): yield int(dt.datetime(day.year, day.month, day.day, h, m, tzinfo=JST).timestamp())
+          def last_at(ts, vals, t_ms):
+              i = bisect.bisect_right(ts, t_ms) - 1
+              return vals[i] if i >= 0 else None
+          path = OUT / f'tick_samples_{SYM}.csv.gz'
+          with gzip.open(path, 'wt', newline='') as f:
+              w = csv.writer(f)
+              head = ['b'] + [f'p_{"m" if o < 0 else "p"}{abs(o)}' for o in OFFS] + ['n60', 'n30', 'n10']
+              if SYM != 'BTCJPY': head += ['bid_0', 'ask_0', 'bid_p180', 'ask_p180']
+              w.writerow(head)
+              day = start
+              while day <= end:
+                  if time.monotonic() - T0 > BUDGET: log('time budget reached at', day); report['stopped_at'] = str(day); break
+                  if SYM != 'BTCJPY' and day.weekday() >= 5: day += dt.timedelta(days=1); continue
+                  ts, mid, bid, ask = [], [], [], []
+                  try:
+                      if SYM == 'BTCJPY':
+                          seen = set(); rows = []
+                          for d in (day - dt.timedelta(days=1), day):
+                              raw = get(f'https://public.bitbank.cc/btc_jpy/transactions/{d:%Y%m%d}')
+                              time.sleep(0.6)
+                              if not raw: continue
+                              for t in ((json.loads(raw).get('data') or {}).get('transactions') or []):
+                                  tid = t.get('transaction_id')
+                                  if tid in seen: continue
+                                  seen.add(tid); rows.append((int(t['executed_at']), float(t['price'])))
+                          rows.sort()
+                          ts = [r[0] for r in rows]; mid = [r[1] for r in rows]
+                          report['files_ok' if rows else 'files_empty'] += 1
+                      else:
+                          start_utc = dt.datetime(day.year, day.month, day.day, 9, tzinfo=JST).astimezone(UTC) - dt.timedelta(hours=1)
+                          for k in range(16):
+                              hh = start_utc + dt.timedelta(hours=k)
+                              raw = get(f'https://datafeed.dukascopy.com/datafeed/{SYM}/{hh.year}/{hh.month - 1:02d}/{hh.day:02d}/{hh.hour:02d}h_ticks.bi5')
+                              time.sleep(0.3)
+                              if not raw: report['files_empty'] += 1; continue
+                              data = lzma.decompress(raw); base = int(hh.timestamp() * 1000)
+                              for j in range(0, len(data) - 19, 20):
+                                  ms, a, b_, av, bv = struct.unpack('>IIIff', data[j:j + 20])
+                                  ts.append(base + ms); ask.append(a / 1000.0); bid.append(b_ / 1000.0); mid.append((a + b_) / 2000.0)
+                              report['files_ok'] += 1
+                      if not ts: log(day, 'no data'); day += dt.timedelta(days=1); continue
+                      for B in boundaries(day):
+                          bm = B * 1000
+                          row = [B] + [last_at(ts, mid, bm + o * 1000) for o in OFFS]
+                          for win in (60000, 30000, 10000): row.append(bisect.bisect_right(ts, bm) - bisect.bisect_right(ts, bm - win))
+                          if SYM != 'BTCJPY':
+                              row += [last_at(ts, bid, bm), last_at(ts, ask, bm), last_at(ts, bid, bm + 180000), last_at(ts, ask, bm + 180000)]
+                          w.writerow(row); report['slots'] += 1
+                      if day.day in (1, 15): log(day, 'ok', len(ts), 'ticks')
+                  except Exception as e:
+                      report['failed'].append(str(day)); log('FAILED', day, e)
+                  day += dt.timedelta(days=1)
+          (OUT / f'report_{SYM}.json').write_text(json.dumps(report, indent=1) + '\n')
+          log('done', json.dumps({k: v for k, v in report.items() if k != 'failed'}), 'failed days:', len(report['failed']))
+          PY
+          python3 ticks.py
+      - uses: actions/upload-artifact@v6.0.0
+        if: always()
+        with:
+          name: tick_${{ matrix.symbol }}
+          path: ticks/
+          if-no-files-found: warn
+  collect:
+    needs: fetch
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with: {pattern: 'tick_*', path: ticks, merge-multiple: true}
+      - name: Summary
+        run: |
+          ls -la ticks
+          for f in ticks/report_*.json; do python3 -c "import json,sys;r=json.load(open(sys.argv[1]));print(r['symbol'],'slots',r['slots'],'ok',r['files_ok'],'empty',r['files_empty'],'failed',len(r['failed']),r.get('stopped_at',''))" "$f"; done
+      - uses: actions/upload-artifact@v6.0.0
+        with:
+          name: GMK_TICKS_${{ inputs.start_date }}_${{ inputs.end_date }}
+          path: ticks/
