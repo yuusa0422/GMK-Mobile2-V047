@@ -1,4 +1,4 @@
-name: GMK Mobile v0.7.79
+name: GMK Mobile v0.7.85
 on: [workflow_dispatch]
 permissions: {contents: read}
 concurrency: {group: 'gmk-${{ github.ref }}', cancel-in-progress: true}
@@ -20,7 +20,7 @@ jobs:
           import os, pathlib, re, subprocess, zipfile
           root = pathlib.Path.cwd()
           helpers = [p for p in root.rglob('tools/build_release.py') if '.git' not in p.parts]
-          stem = 'GMK_MOBILE_V0779_AUDIT2_20261106'
+          stem = 'GMK_MOBILE_V0785_ODDS_20261107'
           archives = [p for p in root.rglob(stem + '*.zip') if '.git' not in p.parts and re.fullmatch(re.escape(stem) + r'(?: ?\([0-9]+\))*\.zip', p.name)]
           if len(archives) == 1 and not helpers:
               with zipfile.ZipFile(archives[0]) as z:
@@ -30,7 +30,7 @@ jobs:
                   helper.write_bytes(z.read(items[0]))
           elif len(helpers) == 1 and not archives:
               helper = helpers[0]
-          else: raise SystemExit('ERROR: keep one v0.7.79 source ZIP or one extracted project')
+          else: raise SystemExit('ERROR: keep one v0.7.85 source ZIP or one extracted project')
           subprocess.run(['python3', str(helper), 'prepare'], check=True)
           PY
       - uses: actions/setup-java@v6.0.1
@@ -52,7 +52,7 @@ jobs:
           import json, time, urllib.request
           def get(u):
               t = time.time()
-              with urllib.request.urlopen(urllib.request.Request(u, headers={'User-Agent': 'GMK-Mobile/0.7.79', 'Accept': 'application/json'}), timeout=10) as r:
+              with urllib.request.urlopen(urllib.request.Request(u, headers={'User-Agent': 'GMK-Mobile/0.7.85', 'Accept': 'application/json'}), timeout=10) as r:
                   return json.loads(r.read()), round((time.time() - t) * 1000)
           now = int(time.time()); s = now - 130 * 60
           for p, b in (('BTC-USD', 'BTCUSDT'), ('ETH-USD', 'ETHUSDT')):
@@ -67,7 +67,7 @@ jobs:
                       print(f'FAIL {p:8s} {name:15s} {type(e).__name__}: {str(e)[:120]}')
           PY
       - uses: actions/upload-artifact@v6.0.0
-        with: {name: GMK_MOBILE_V0779_APK, path: artifacts/, if-no-files-found: error}
+        with: {name: GMK_MOBILE_V0785_APK, path: artifacts/, if-no-files-found: error}
       - uses: actions/upload-artifact@v6.0.0
         if: failure()
         with: {name: GMK-build-diagnostics, path: "gradle-build.log\nbuild-environment.log\n${{ env.GMK_PROJECT }}/app/build/reports/\n${{ env.GMK_PROJECT }}/app/build/test-results/", if-no-files-found: ignore}
